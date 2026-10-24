@@ -1,75 +1,34 @@
 #!/usr/bin/env bash
 
-# Archivos de base de datos SQLite3, reportes y logs
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ -f "data.sq3" ]]; then
-    DB_FILE="data.sq3"
-elif [[ -f "$SCRIPT_DIR/data.sq3" ]]; then
-    DB_FILE="$SCRIPT_DIR/data.sq3"
-else
-    DB_FILE="data.sq3"
-fi
+DB_FILE="data.sq3"
+LOG_SYSTEM="system.log"
+LOG_ERROR="error.log"
+FILE_REPORTE="productos.html"
 
-SYSTEM_LOG="system.log"
-ERROR_LOG="error.log"
-REPORTE_HTML="productos.html"
 
-# Variables de sesión para registro en logs
-SESSION_USER_ID="-"
-SESSION_USERNAME="-"
+SESSION_ID="-"
+SESSION_USER="-"
 
-# Constantes de menú inicial
-declare -r -i OPCION_INICIO_LOGIN=1
-declare -r -i OPCION_INICIO_REGISTRO=2
-declare -r -i OPCION_INICIO_SALIR=3
 
-# Constantes de menú principal de acciones
-declare -r -i OPCION_ALTA=1
-declare -r -i OPCION_BAJA=2
-declare -r -i OPCION_MODIFICAR=3
-declare -r -i OPCION_MOSTRAR=4
-declare -r -i OPCION_REPORTE=5
-declare -r -i OPCION_SALIR=6
-
-# Registro en log de sistema (TSV: fecha/hora, ID usuario, nombre usuario, acción)
 log_system() {
-    declare uid="${1:-${SESSION_USER_ID:--}}"
-    declare uname="${2:-${SESSION_USERNAME:--}}"
-    declare accion="$3"
-    declare fecha_hora
-    fecha_hora=$(date '+%Y-%m-%d %H:%M:%S')
-
-    printf "%s\t%s\t%s\t%s\n" "$fecha_hora" "$uid" "$uname" "$accion" >> "$SYSTEM_LOG"
+    local accion="$1"
+    local fecha_hora=$(date '+%Y-%m-%d %H:%M:%S')
+    printf "%s\t%s\t%s\t%s\n" "$fecha_hora" "$SESSION_ID" "$SESSION_USER" "$accion" >> "$LOG_SYSTEM"
 }
 
-# Registro en log de errores
 log_error() {
-    declare mensaje="$1"
-    declare uid="${SESSION_USER_ID:--}"
-    declare uname="${SESSION_USERNAME:--}"
-    declare fecha_hora
-    fecha_hora=$(date '+%Y-%m-%d %H:%M:%S')
-
-    printf "%s\t%s\t%s\t%s\n" "$fecha_hora" "$uid" "$uname" "$mensaje" >> "$ERROR_LOG"
+    local mensaje="$1"
+    local fecha_hora=$(date '+%Y-%m-%d %H:%M:%S')
+    printf "%s\t%s\t%s\t%s\n" "$fecha_hora" "$SESSION_ID" "$SESSION_USER" "$mensaje" >> "$LOG_ERROR"
 }
 
-# Verificar disponibilidad de SQLite3 en el sistema
-verificar_dependencias() {
-    if ! command -v sqlite3 &>/dev/null; then
-        printf "Error: sqlite3 no se encuentra instalado en el sistema.\n" >&2
-        printf "Por favor, instale sqlite3 ejecutando: sudo apt install sqlite3\n" >&2
-        log_error "sqlite3 no esta instalado en el sistema"
-        return 1
-    fi
-    return 0
-}
 
-# Inicialización de la base de datos data.sq3 y sus tablas
 inicializar_db() {
-    declare db_existia=1
-    if [[ ! -f "$DB_FILE" ]]; then
-        db_existia=0
+
+    if ! command -v sqlite3 &>/dev/null; then
+        echo "Error: sqlite3 no está instalado. Ejecute: sudo apt install sqlite3"
+        exit 1
     fi
 
     sqlite3 "$DB_FILE" << 'EOF'
@@ -78,466 +37,248 @@ CREATE TABLE IF NOT EXISTS usuarios (
     usuario TEXT UNIQUE NOT NULL,
     clave TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS productos (
     id TEXT PRIMARY KEY,
     nombre TEXT NOT NULL,
     precio NUMERIC NOT NULL
 );
 EOF
-
-    declare status_sql=$?
-    if [[ $status_sql -ne 0 ]]; then
-        log_error "Fallo al inicializar la base de datos '$DB_FILE'"
-        return 1
-    fi
-
-    if [[ $db_existia -eq 0 ]]; then
-        log_system "-" "SYSTEM" "Base de datos '$DB_FILE' creada e inicializada exitosamente"
-    fi
-
-    return 0
 }
 
-bienvenida() {
-    printf "Bienvenido/a al sistema\n\n"
+cifrar_clave() {
+    local clave="$1"
+    local raw=$(echo "$clave" | sha256sum)
+    echo "${raw:0:64}"
 }
 
-# Autenticación de usuarios contra tabla SQL 'usuarios' usando sha256
-autenticar() {
-    declare -i intentos=0
-    declare usuario=""
-    declare clave=""
-
-    declare total_usuarios
-    total_usuarios=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM usuarios;" 2>/dev/null)
-
-    if [[ -z "$total_usuarios" || "$total_usuarios" -eq 0 ]]; then
-        printf "No existen usuarios registrados. Por favor registre un usuario primero.\n\n"
-        log_error "Intento de inicio de sesion sin usuarios registrados"
-        return 2
-    fi
-
-    while (( intentos < 3 )); do
-        read -rp "Ingrese usuario: " usuario
-        read -rp "Ingrese clave: " clave
-
-        declare raw_hash raw_hash_n
-        raw_hash=$(echo "$clave" | sha256sum)
-        declare hash_ingresado=${raw_hash:0:64}
-        raw_hash_n=$(echo -n "$clave" | sha256sum)
-        declare hash_ingresado_n=${raw_hash_n:0:64}
-
-        declare usuario_sql="${usuario//\'/\'\'}"
-        declare row
-        row=$(sqlite3 -separator $'\t' "$DB_FILE" "SELECT id, usuario, clave FROM usuarios WHERE usuario = '$usuario_sql' LIMIT 1;" 2>/dev/null)
-
-        if [[ -n "$row" ]]; then
-            declare u_id u_name u_hash
-            u_id=$(printf "%s" "$row" | cut -f1)
-            u_name=$(printf "%s" "$row" | cut -f2)
-            u_hash=$(printf "%s" "$row" | cut -f3)
-
-            u_hash="${u_hash%$'\r'}"
-
-            if [[ "$u_hash" == "$hash_ingresado" || "$u_hash" == "$hash_ingresado_n" ]]; then
-                SESSION_USER_ID="$u_id"
-                SESSION_USERNAME="$u_name"
-                printf "Acceso concedido.\n"
-                log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Inicio de sesion exitoso"
-                return 0
-            fi
-        fi
-
-        intentos=$((intentos + 1))
-        printf "Credenciales incorrectas (%d/3 intentos).\n" "$intentos"
-        log_error "Credenciales incorrectas para usuario: '$usuario' (intento $intentos/3)"
-    done
-
-    log_error "Acceso denegado: superado limite de 3 intentos para usuario: '$usuario'"
-    return 1
-}
-
-# Registro de nuevos usuarios en base de datos SQLite con clave cifrada sha256
 registrar_usuario() {
-    declare usuario=""
-    declare clave=""
+    local user="" clave=""
+    read -rp "Ingrese nombre de usuario: " user
 
-    read -rp "Ingrese nombre de usuario: " usuario
-
-    if [[ -z "$usuario" ]]; then
-        printf "Error: El nombre de usuario no puede estar vacio.\n"
-        log_error "Registro fallido: el nombre de usuario no puede estar vacio"
-        return 1
+    if [[ -z "$user" ]]; then
+        echo "Error: El usuario no puede estar vacío."
+        log_error "Registro fallido: usuario vacío"
+        return
     fi
 
-    # Validar que no se agregue un usuario ya existente
-    declare usuario_sql="${usuario//\'/\'\'}"
-    declare existe
-    existe=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM usuarios WHERE usuario = '$usuario_sql';" 2>/dev/null)
-
+    local existe=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM usuarios WHERE usuario='$user';")
     if [[ "$existe" -gt 0 ]]; then
-        printf "Error: El usuario ya existe.\n"
-        log_error "Registro fallido: el usuario '$usuario' ya existe"
-        return 1
+        echo "Error: El usuario '$user' ya existe."
+        log_error "Registro fallido: usuario '$user' ya existe"
+        return
     fi
 
     read -rp "Ingrese contraseña: " clave
-
     if [[ -z "$clave" ]]; then
-        printf "Error: La contraseña no puede estar vacia.\n"
-        log_error "Registro fallido para '$usuario': la contraseña no puede estar vacia"
-        return 1
+        echo "Error: La contraseña no puede estar vacía."
+        log_error "Registro fallido: contraseña vacía para usuario '$user'"
+        return
     fi
 
-    # Cifrado sha256 usando buffer y extracción de subcadena
-    declare raw_hash
-    raw_hash=$(echo "$clave" | sha256sum)
-    declare hash_cifrado=${raw_hash:0:64}
-    declare clave_sql="${hash_cifrado//\'/\'\'}"
+    local hash=$(cifrar_clave "$clave")
+    sqlite3 "$DB_FILE" "INSERT INTO usuarios (usuario, clave) VALUES ('$user', '$hash');"
 
-    sqlite3 "$DB_FILE" "INSERT INTO usuarios (usuario, clave) VALUES ('$usuario_sql', '$clave_sql');" 2>/dev/null
-    declare status_sql=$?
-
-    if [[ $status_sql -ne 0 ]]; then
-        printf "Error al guardar el usuario en la base de datos.\n"
-        log_error "Error al ejecutar INSERT en tabla usuarios para usuario '$usuario'"
-        return 1
-    fi
-
-    declare nuevo_id
-    nuevo_id=$(sqlite3 "$DB_FILE" "SELECT id FROM usuarios WHERE usuario = '$usuario_sql' LIMIT 1;" 2>/dev/null)
-    log_system "$nuevo_id" "$usuario" "Registro de nuevo usuario"
-
-    printf "Usuario '%s' registrado exitosamente.\n" "$usuario"
-    return 0
+    echo "Usuario '$user' registrado con éxito."
+    log_system "Registro de nuevo usuario: $user"
 }
 
-# Comprobar existencia de producto por ID en SQLite
-producto_existe() {
-    declare id_buscar="$1"
-    declare id_sql="${id_buscar//\'/\'\'}"
-    declare count
-    count=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM productos WHERE id = '$id_sql';" 2>/dev/null)
-
-    if [[ "$count" -gt 0 ]]; then
-        return 0
+autenticar() {
+    local total=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM usuarios;")
+    if [[ "$total" -eq 0 ]]; then
+        echo "No hay usuarios registrados. Por favor registre un usuario primero."
+        log_error "Intento de inicio de sesión sin usuarios en la base de datos"
+        return 1
     fi
+
+    local intentos=0 user="" clave=""
+    while (( intentos < 3 )); do
+        read -rp "Usuario: " user
+        read -rp "Contraseña: " clave
+
+        local hash_ingresado=$(cifrar_clave "$clave")
+        local fila=$(sqlite3 -separator '|' "$DB_FILE" "SELECT id, usuario FROM usuarios WHERE usuario='$user' AND clave='$hash_ingresado' LIMIT 1;")
+
+        if [[ -n "$fila" ]]; then
+            SESSION_ID=$(echo "$fila" | cut -d'|' -f1)
+            SESSION_USER=$(echo "$fila" | cut -d'|' -f2)
+
+            echo "Acceso concedido. Bienvenido/a $SESSION_USER!"
+            log_system "Inicio de sesión exitoso"
+            return 0
+        fi
+
+        intentos=$((intentos + 1))
+        echo "Credenciales incorrectas ($intentos/3 intentos)."
+        log_error "Credenciales incorrectas para usuario '$user' ($intentos/3)"
+    done
+
+    log_error "Acceso denegado: superado límite de intentos para usuario '$user'"
     return 1
 }
 
-# Alta de producto en base de datos SQLite
-alta() {
-    declare id="$1"
-    declare nombre="$2"
-    declare precio="$3"
-
-    if [[ -z "$id" || -z "$nombre" || -z "$precio" ]]; then
-        printf "Error: Todos los campos (ID, Nombre, Precio) son obligatorios.\n"
-        log_error "Alta fallida: campos obligatorios incompletos (ID='$id', Nombre='$nombre', Precio='$precio')"
-        return 1
-    fi
-
-    if producto_existe "$id"; then
-        printf "Error: El producto con ID '%s' ya existe.\n" "$id"
-        log_error "Alta fallida: el producto con ID '$id' ya existe"
-        return 1
-    fi
-
-    declare id_sql="${id//\'/\'\'}"
-    declare nombre_sql="${nombre//\'/\'\'}"
-    declare precio_sql="${precio//\'/\'\'}"
-
-    sqlite3 "$DB_FILE" "INSERT INTO productos (id, nombre, precio) VALUES ('$id_sql', '$nombre_sql', '$precio_sql');" 2>/dev/null
-    declare status_sql=$?
-
-    if [[ $status_sql -ne 0 ]]; then
-        printf "Error al guardar el producto en la base de datos.\n"
-        log_error "Error al ejecutar INSERT en tabla productos para ID '$id'"
-        return 1
-    fi
-
-    log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Alta producto (ID: $id, Nombre: $nombre, Precio: $precio)"
-    printf "Producto %s guardado correctamente.\n" "$id"
-    return 0
-}
-
-# Baja de producto en base de datos SQLite
-baja() {
-    declare id="$1"
+alta_producto() {
+    local id="" nombre="" precio=""
+    read -rp "Ingrese ID: " id
 
     if [[ -z "$id" ]]; then
-        printf "Error: Debe ingresar un ID.\n"
-        log_error "Baja fallida: ID de producto no ingresado"
-        return 1
+        echo "Error: El ID no puede estar vacío."
+        log_error "Alta fallida: ID vacío"
+        return
     fi
 
-    if ! producto_existe "$id"; then
-        printf "El producto no existe.\n"
-        log_error "Baja fallida: el producto con ID '$id' no existe"
-        return 1
+    local existe=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM productos WHERE id='$id';")
+    if [[ "$existe" -gt 0 ]]; then
+        echo "Error: Ya existe un producto con el ID '$id'."
+        log_error "Alta fallida: ID '$id' ya existente"
+        return
     fi
 
-    declare id_sql="${id//\'/\'\'}"
-    sqlite3 "$DB_FILE" "DELETE FROM productos WHERE id = '$id_sql';" 2>/dev/null
-    declare status_sql=$?
+    read -rp "Ingrese Nombre: " nombre
+    read -rp "Ingrese Precio: " precio
 
-    if [[ $status_sql -ne 0 ]]; then
-        printf "Error al eliminar el producto de la base de datos.\n"
-        log_error "Error al ejecutar DELETE en tabla productos para ID '$id'"
-        return 1
-    fi
-
-    log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Baja producto (ID: $id)"
-    printf "Producto %s eliminado.\n" "$id"
-    return 0
+    sqlite3 "$DB_FILE" "INSERT INTO productos (id, nombre, precio) VALUES ('$id', '$nombre', '$precio');"
+    echo "Producto '$nombre' agregado con éxito."
+    log_system "Alta producto (ID: $id, Nombre: $nombre, Precio: $precio)"
 }
 
-# Modificar producto en base de datos SQLite
-modificar() {
-    declare id="$1"
+baja_producto() {
+    local id=""
+    read -rp "Ingrese ID a eliminar: " id
 
-    if [[ -z "$id" ]]; then
-        printf "Error: Debe ingresar un ID.\n"
-        log_error "Modificacion fallida: ID de producto no ingresado"
-        return 1
+    local existe=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM productos WHERE id='$id';")
+    if [[ "$existe" -eq 0 ]]; then
+        echo "Error: El producto con ID '$id' no existe."
+        log_error "Baja fallida: ID '$id' no encontrado"
+        return
     fi
 
-    if ! producto_existe "$id"; then
-        printf "El producto no existe.\n"
-        log_error "Modificacion fallida: el producto con ID '$id' no existe"
-        return 1
-    fi
-
-    declare id_sql="${id//\'/\'\'}"
-    declare row
-    row=$(sqlite3 -separator $'\t' "$DB_FILE" "SELECT nombre, precio FROM productos WHERE id = '$id_sql' LIMIT 1;" 2>/dev/null)
-
-    declare actual_nombre actual_precio
-    actual_nombre=$(printf "%s" "$row" | cut -f1)
-    actual_precio=$(printf "%s" "$row" | cut -f2)
-
-    declare nuevo_nombre=""
-    declare nuevo_precio=""
-    read -rp "Ingrese nuevo Nombre: " nuevo_nombre
-    read -rp "Ingrese nuevo Precio: " nuevo_precio
-
-    if [[ -z "$nuevo_nombre" ]]; then
-        nuevo_nombre="$actual_nombre"
-    fi
-    if [[ -z "$nuevo_precio" ]]; then
-        nuevo_precio="$actual_precio"
-    fi
-
-    declare nuevo_nombre_sql="${nuevo_nombre//\'/\'\'}"
-    declare nuevo_precio_sql="${nuevo_precio//\'/\'\'}"
-
-    sqlite3 "$DB_FILE" "UPDATE productos SET nombre = '$nuevo_nombre_sql', precio = '$nuevo_precio_sql' WHERE id = '$id_sql';" 2>/dev/null
-    declare status_sql=$?
-
-    if [[ $status_sql -ne 0 ]]; then
-        printf "Error al modificar el producto en la base de datos.\n"
-        log_error "Error al ejecutar UPDATE en tabla productos para ID '$id'"
-        return 1
-    fi
-
-    log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Modificar producto (ID: $id, Nombre: $nuevo_nombre, Precio: $nuevo_precio)"
-    printf "Producto %s modificado con precio $%s.\n" "$id" "$nuevo_precio"
-    return 0
+    sqlite3 "$DB_FILE" "DELETE FROM productos WHERE id='$id';"
+    echo "Producto '$id' eliminado con éxito."
+    log_system "Baja producto (ID: $id)"
 }
 
-# Mostrar inventario listando los productos desde la base de datos SQLite
-mostrar() {
-    declare total_prods
-    total_prods=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM productos;" 2>/dev/null)
+modificar_producto() {
+    local id=""
+    read -rp "Ingrese ID a modificar: " id
 
-    if [[ -z "$total_prods" || "$total_prods" -eq 0 ]]; then
-        printf "\nLISTADO:\n"
-        printf "No hay productos registrados.\n"
-        log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Mostrar inventario (vacio)"
-        return 0
+    local existe=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM productos WHERE id='$id';")
+    if [[ "$existe" -eq 0 ]]; then
+        echo "Error: El producto con ID '$id' no existe."
+        log_error "Modificación fallida: ID '$id' no encontrado"
+        return
     fi
 
-    printf "\nLISTADO:\n"
-    sqlite3 -separator $'\t' "$DB_FILE" "SELECT id, nombre, precio FROM productos;" 2>/dev/null | while IFS=$'\t' read -r col1 col2 col3; do
-        col3="${col3%$'\r'}"
-        col2="${col2%$'\r'}"
-        col1="${col1%$'\r'}"
-        [[ -z "$col1" ]] && continue
-        printf "ID %s : %s - $%s\n" "$col1" "$col2" "$col3"
+    local nuevo_nom="" nuevo_pre=""
+    read -rp "Ingrese nuevo Nombre: " nuevo_nom
+    read -rp "Ingrese nuevo Precio: " nuevo_pre
+
+    sqlite3 "$DB_FILE" "UPDATE productos SET nombre='$nuevo_nom', precio='$nuevo_pre' WHERE id='$id';"
+    echo "Producto '$id' modificado con éxito."
+    log_system "Modificar producto (ID: $id, NuevoNombre: $nuevo_nom, NuevoPrecio: $nuevo_pre)"
+}
+
+mostrar_productos() {
+    echo -e "\nLISTADO DE PRODUCTOS:"
+    echo -e "ID\tNombre\tPrecio"
+    echo "-----------------------------------"
+
+    local total=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM productos;")
+    if [[ "$total" -eq 0 ]]; then
+        echo "No hay productos registrados."
+    else
+        sqlite3 -separator $'\t' "$DB_FILE" "SELECT id, nombre, '$' || precio FROM productos;"
+    fi
+
+    log_system "Consulta de inventario"
+}
+
+generar_reporte_html() {
+    echo "<html>" > "$FILE_REPORTE"
+    echo "<head><meta charset='UTF-8'><title>Reporte de Productos</title></head>" >> "$FILE_REPORTE"
+    echo "<body>" >> "$FILE_REPORTE"
+    echo "  <h1>Reporte de Productos</h1>" >> "$FILE_REPORTE"
+    echo "  <table border='1' cellpadding='8'>" >> "$FILE_REPORTE"
+    echo "    <tr><th>ID</th><th>Nombre</th><th>Precio</th></tr>" >> "$FILE_REPORTE"
+
+
+    sqlite3 -separator $'\t' "$DB_FILE" "SELECT id, nombre, precio FROM productos;" | while IFS=$'\t' read -r id nom pre; do
+        if [[ -n "$id" ]]; then
+            echo "    <tr><td>$id</td><td>$nom</td><td>$$pre</td></tr>" >> "$FILE_REPORTE"
+        fi
     done
 
-    log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Mostrar inventario"
-    return 0
+    echo "  </table>" >> "$FILE_REPORTE"
+    echo "</body>" >> "$FILE_REPORTE"
+    echo "</html>" >> "$FILE_REPORTE"
+
+    echo "Reporte HTML generado exitosamente en '$FILE_REPORTE'."
+    log_system "Generación de reporte HTML ($FILE_REPORTE)"
 }
 
-# Generar archivo de reporte productos.html en formato de tabla
-generar_reporte() {
-    cat << 'EOF' > "$REPORTE_HTML"
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <title>Reporte de Productos</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 30px;
-            background-color: #f8f9fa;
-        }
-        h1 {
-            color: #333333;
-        }
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            max-width: 650px;
-            background-color: #ffffff;
-            border: 1px solid #dee2e6;
-        }
-        th, td {
-            border: 1px solid #dee2e6;
-            padding: 10px 14px;
-            text-align: left;
-        }
-        th {
-            background-color: #007bff;
-            color: #ffffff;
-        }
-        tr:nth-child(even) {
-            background-color: #f2f2f2;
-        }
-    </style>
-</head>
-<body>
-    <h1>Reporte de Productos</h1>
-    <table>
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>Nombre</th>
-                <th>Precio</th>
-            </tr>
-        </thead>
-        <tbody>
-EOF
-
-    sqlite3 -separator $'\t' "$DB_FILE" "SELECT id, nombre, precio FROM productos;" 2>/dev/null | while IFS=$'\t' read -r col1 col2 col3; do
-        col3="${col3%$'\r'}"
-        col2="${col2%$'\r'}"
-        col1="${col1%$'\r'}"
-        [[ -z "$col1" ]] && continue
-        printf "            <tr><td>%s</td><td>%s</td><td>$%s</td></tr>\n" "$col1" "$col2" "$col3" >> "$REPORTE_HTML"
-    done
-
-    cat << 'EOF' >> "$REPORTE_HTML"
-        </tbody>
-    </table>
-</body>
-</html>
-EOF
-
-    log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Generar reporte HTML: $REPORTE_HTML"
-    printf "Reporte '%s' generado exitosamente.\n" "$REPORTE_HTML"
-    return 0
-}
-
-main() {
-    if ! verificar_dependencias; then
-        return 1
-    fi
-
-    if ! inicializar_db; then
-        return 1
-    fi
-
-    bienvenida
-
-    declare -i sesion_iniciada=0
-    declare opcion_inicio=""
-
-    while (( sesion_iniciada == 0 )); do
-        printf "1. Iniciar sesion\n"
-        printf "2. Registrar usuario\n"
-        printf "3. Salir\n"
-        read -rp "Opcion: " opcion_inicio
-
-        case $opcion_inicio in
-            $OPCION_INICIO_LOGIN)
-                autenticar
-                declare estado_auth=$?
-                if (( estado_auth == 0 )); then
-                    sesion_iniciada=1
-                elif (( estado_auth == 1 )); then
-                    printf "\nAcceso denegado.\n"
-                    return 1
-                fi
-                # Si estado_auth == 2 (no hay usuarios registrados), vuelve al menú
-                ;;
-            $OPCION_INICIO_REGISTRO)
-                registrar_usuario
-                printf "\n"
-                ;;
-            $OPCION_INICIO_SALIR)
-                log_system "-" "-" "Salir del menu inicial"
-                printf "\nSaliendo del programa...\n"
-                return 0
-                ;;
-            *)
-                log_error "Opcion invalida en menu inicial: '$opcion_inicio'"
-                printf "\nOpcion invalida.\n\n"
-                ;;
-        esac
-    done
-
-    declare opcion=0
-
-    while [[ "$opcion" != "$OPCION_SALIR" ]]; do
-        printf "\nACCIONES:\n"
-        printf "1. Alta producto\n"
-        printf "2. Baja producto\n"
-        printf "3. Modificar producto\n"
-        printf "4. Mostrar inventario\n"
-        printf "5. Generar reporte HTML\n"
-        printf "6. Salir\n"
+menu_principal() {
+    local opcion=""
+    while [[ "$opcion" != "6" ]]; do
+        echo -e "\nACCIONES:"
+        echo "1. Alta producto"
+        echo "2. Baja producto"
+        echo "3. Modificar producto"
+        echo "4. Mostrar inventario"
+        echo "5. Generar reporte HTML"
+        echo "6. Salir"
         read -rp "Opcion: " opcion
 
         case $opcion in
-            $OPCION_ALTA)
-                declare id="" nombre="" precio=""
-                read -rp "Ingrese ID: " id
-                read -rp "Ingrese Nombre: " nombre
-                read -rp "Ingrese Precio: " precio
-                alta "$id" "$nombre" "$precio"
-                ;;
-            $OPCION_BAJA)
-                declare id=""
-                read -rp "Ingrese ID a eliminar: " id
-                baja "$id"
-                ;;
-            $OPCION_MODIFICAR)
-                declare id=""
-                read -rp "Ingrese ID a modificar: " id
-                modificar "$id"
-                ;;
-            $OPCION_MOSTRAR)
-                mostrar
-                ;;
-            $OPCION_REPORTE)
-                generar_reporte
-                ;;
-            $OPCION_SALIR)
-                log_system "$SESSION_USER_ID" "$SESSION_USERNAME" "Salir del sistema"
-                printf "\nSaliendo del programa...\n"
+            1) alta_producto ;;
+            2) baja_producto ;;
+            3) modificar_producto ;;
+            4) mostrar_productos ;;
+            5) generar_reporte_html ;;
+            6)
+                log_system "Cierre de sesión"
+                SESSION_ID="-"
+                SESSION_USER="-"
+                echo "Cerrando sesión..."
                 ;;
             *)
-                log_error "Opcion invalida en menu principal: '$opcion'"
-                printf "\nOpcion invalida.\n"
+                echo "Opción inválida."
+                log_error "Opción de menú inválida: $opcion"
                 ;;
         esac
     done
+}
 
-    return 0
+main() {
+    inicializar_db
+    echo "Bienvenido/a al sistema"
+
+    local opcion_inicio=""
+    while true; do
+        echo -e "\nMENU DE INICIO:"
+        echo "1. Iniciar sesion"
+        echo "2. Registrar usuario"
+        echo "3. Salir"
+        read -rp "Opcion: " opcion_inicio
+
+        case $opcion_inicio in
+            1)
+                if autenticar; then
+                    menu_principal
+                else
+                    echo "Acceso denegado."
+                fi
+                ;;
+            2) registrar_usuario ;;
+            3)
+                log_system "Salida del programa"
+                echo "Saliendo del programa..."
+                exit 0
+                ;;
+            *)
+                echo "Opción inválida."
+                log_error "Opción de menú inicio inválida: $opcion_inicio"
+                ;;
+        esac
+    done
 }
 
 main
